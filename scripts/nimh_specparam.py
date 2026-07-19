@@ -17,8 +17,6 @@ from specparam import __version__ as specparam_version
 from specparam.data.periodic import get_band_peak_group
 from specparam.reports.methods import methods_report_info, methods_report_text
 
-print(f"specparam version: {specparam_version}")
-
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -31,10 +29,10 @@ OUT_DIR.mkdir(exist_ok=True)
 FIG_DIR.mkdir(exist_ok=True)
 
 # Fitting settings
-FREQ_RANGE      = [1, 45]   # full range
+FREQ_RANGE      = [1, 40]   # trimmed range (to avoid high-freq noise)
 PEAK_WIDTH_LIMS = [1, 8]
-MAX_N_PEAKS     = 4
-MIN_PEAK_HEIGHT = 0.03      # lowered from 0.05 to capture theta/small peaks
+MAX_N_PEAKS     = 6
+MIN_PEAK_HEIGHT = 0.05      # lowered from 0.05 to capture theta/small peaks
 APERIODIC_MODE  = 'fixed'   # no bend, thus no knee mode. 
 
 # Frequency bands (from tutorial 11)
@@ -43,8 +41,7 @@ bands = Bands({
     'theta' : [4,  8],
     'alpha' : [8,  13],
     'beta'  : [13, 30],
-    'gamma' : [30, 45],
-})
+    'gamma' : [30, 45],})
 
 # =============================================================================
 # Loading per subjects's HDF5 .mat file
@@ -59,25 +56,10 @@ def load_psd(filepath):
             ref  = f['chan_labels'][0, i]
             name = ''.join(chr(c) for c in f[ref][:].flatten())
             labels.append(name)
-    return freq, pow_, labels
+    return freq, pow_, labels  #extract frequency vector, the per-channel power spectra, and channel-names
 
-# =============================================================================
-# PRINT METHODS REPORT (from tutorial 12 — Reporting)
-# =============================================================================
-
-print("\n" + "="*70)
-print("METHODS REPORT")
-print("="*70)
-_demo_fg = SpectralGroupModel(
-    peak_width_limits = PEAK_WIDTH_LIMS,
-    max_n_peaks       = MAX_N_PEAKS,
-    min_peak_height   = MIN_PEAK_HEIGHT,
-    aperiodic_mode    = APERIODIC_MODE,
-    verbose           = False,
-)
-methods_report_info(_demo_fg)
-methods_report_text(_demo_fg)
-print("="*70 + "\n")
+if __name__ == '__main__':
+    print(f"specparam version: {specparam_version}")
 
 # =============================================================================
 # MAIN FITTING LOOP
@@ -90,7 +72,7 @@ null_log  = []   # failed fits log
 mat_files = sorted(DATA_DIR.glob('*_psd.mat'))
 print(f"Found {len(mat_files)} subjects\n")
 
-for mat_path in mat_files:
+for idx, mat_path in enumerate(mat_files):
     sub = mat_path.stem.replace('_psd', '')
     print(f"Fitting {sub} ...", end=' ', flush=True)
 
@@ -101,10 +83,17 @@ for mat_path in mat_files:
         max_n_peaks       = MAX_N_PEAKS,
         min_peak_height   = MIN_PEAK_HEIGHT,
         aperiodic_mode    = APERIODIC_MODE,
-        verbose           = False,
-    )
-    fg.fit(freq, pow_, FREQ_RANGE)
+        verbose           = False,)
+    fg.fit(freq, pow_, FREQ_RANGE, n_jobs=1)
 
+    # ── print methods report once, from the first subject's fit (tutorial 12) ──
+    if idx == 0:
+            print("\n" + "="*70)
+            print("METHODS REPORT")
+            print("="*70)
+            methods_report_info(fg)
+            methods_report_text(fg)
+        
     # ── check for failed fits (from manage/plot_failed_fits) ──────────────────
     n_null   = fg.results.n_null
     null_idx = fg.results.null_inds
@@ -112,11 +101,26 @@ for mat_path in mat_files:
         print(f"\n  WARNING: {n_null} null fits at channel indices {null_idx}")
         null_log.append({'subject': sub, 'n_null': n_null, 'null_indices': str(null_idx)})
 
-    # ── aperiodic params ──────────────────────────────────────────────────────
-    ap      = fg.get_params('aperiodic')       # (n_ch, 2): offset, exponent
-    results = fg.results.group_results
-    r2  = np.array([r.metrics['gof_rsquared'] for r in results])
-    mae = np.array([r.metrics['error_mae']     for r in results])
+    # ── aperiodic params : get_metrics/get_params pull arrays across the whole group fit ────────────────────
+    offset   = fg.get_params('aperiodic', 'offset')
+    exponent = fg.get_params('aperiodic', 'exponent')
+    knee     = fg.get_params('aperiodic', 'knee') if APERIODIC_MODE == 'knee' else None
+    r2     = fg.get_metrics('gof_rsquared')
+    adj_r2 = fg.get_metrics('gof_adjrsquared')
+    mae    = fg.get_metrics('error_mae')
+    rmse   = np.sqrt(fg.get_metrics('error_mse'))   # RMSE = sqrt(MSE)
+
+    # ── every fitted peak (not just one-per-band) for CF/PW distributions ─────
+    # get_params('peak') returns [CF, PW, BW, ch_index] pooled across the group.
+    all_pk = fg.get_params('peak')
+        if all_pk is not None and np.size(all_pk):
+            all_pk = np.atleast_2d(all_pk)
+            n_peaks_per_ch = np.bincount(all_pk[:, 3].astype(int), minlength=len(labels)) #detected peak per channel is counted
+            for cf, pw, bw, _ci in all_pk:
+                allpeak_rows.append({'subject': sub, 'CF': cf, 'PW': pw, 'BW': bw}) 
+        else:
+            n_peaks_per_ch = np.zeros(len(labels), dtype=int)
+
 
     for ch_idx, label in enumerate(labels):
         ap_rows.append({
@@ -124,10 +128,15 @@ for mat_path in mat_files:
             'channel'  : label,
             'ch_index' : ch_idx,
             'offset'   : ap[ch_idx, 0],
-            'exponent' : ap[ch_idx, 1],
-            'r_squared': r2[ch_idx],
-            'error_mae': mae[ch_idx],
-        })
+            'offset'    : offset[ch_idx],
+            'knee'      : knee[ch_idx] if knee is not None else np.nan,
+            'exponent'  : exponent[ch_idx],
+            'r_squared' : r2[ch_idx],
+            'adj_r_squared' : adj_r2[ch_idx],
+            'r2_adj_gap' : r2[ch_idx] - adj_r2[ch_idx],   # overfitting indicator (tutorial 06)
+            'error_mae' : mae[ch_idx],
+            'rmse'      : rmse[ch_idx],
+            'n_peaks'   : int(n_peaks_per_ch[ch_idx]),})
 
     # ── band peaks using get_band_peak_group (from tutorial 11) ──────────────
     # Returns (n_ch, 3) array of [CF, PW, BW]; NaN where no peak found
@@ -146,20 +155,24 @@ for mat_path in mat_files:
             })
 
     # ── per-subject figure ────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
     fig.suptitle(sub, fontsize=12, fontweight='bold')
 
-    mid_ch = int(np.argsort(r2)[len(r2) // 2])
-    fg.get_model(mid_ch, regenerate=True).plot(ax=axes[0])
-    axes[0].set_title(f'Example fit — {labels[mid_ch]}  (R²={r2[mid_ch]:.3f})')
+    best_ch = int(np.argmax(r2))
+    fg.get_model(best_ch, regenerate=True).plot(ax=axes[0])
+    axes[0].set_title(f'Best fit — {labels[best_ch]}  (R²={r2[best_ch]:.3f})') #plot best channel fit for subject
 
-    axes[1].hist(r2, bins=30, color='steelblue', edgecolor='white')
-    axes[1].axvline(r2.mean(), color='red', linestyle='--',
+    worst_ch = int(np.argmin(r2))
+    fg.get_model(worst_ch, regenerate=True).plot(ax=axes[1])
+    axes[1].set_title(f'Worst fit — {labels[worst_ch]}  (R²={r2[worst_ch]:.3f})') #plot worst channel fit for subject
+
+    axes[2].hist(r2, bins=30, color='steelblue', edgecolor='white')
+    axes[2].axvline(r2.mean(), color='red', linestyle='--',
                     label=f'mean = {r2.mean():.3f}')
-    axes[1].set_xlabel('R²')
-    axes[1].set_ylabel('Channels')
-    axes[1].set_title('Goodness of fit across channels')
-    axes[1].legend()
+    axes[2].set_xlabel('R²')
+    axes[2].set_ylabel('Channels')
+    axes[2].set_title('Goodness of fit across channels')
+    axes[2].legend()
 
     plt.tight_layout()
     plt.savefig(FIG_DIR / f'{sub}_summary.png', dpi=120)
@@ -374,7 +387,8 @@ print(summary[['subject_id','age','mean_exponent','mean_offset',
 """
 Outputs
 -------
-results/nimh_aperiodic.csv    — offset + exponent per channel per subject
+results/nimh_aperiodic.csv    — offset, knee (NaN in fixed mode), exponent, r_squared, adj_r_squared, r2_adj_gap, error_mae, rmse, n_peaks
+                                per channel per subject
 results/nimh_peaks.csv        — CF, PW, BW per band per channel per subject
 results/nimh_subject_summary.csv — subject-level means + age merged
 results/figures/              — per-subject and group figures
